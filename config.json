@@ -1,0 +1,7 @@
+{
+    "master_dir": "E:\\backup Hairoad sync\\lablelsv2\\Sensorbox Raw Lidar Data\\2025-07-11_12-48-59",
+    "camera_dir": "E:\\backup Hairoad sync\\lablelsv2\\Sensorbox Raw Camera Data",
+    "output_dir": "E:\\backup Hairoad sync\\juli 2025\\synced_output6",
+    "border": 100,
+    "time_diff_threshold": 0.05
+}
