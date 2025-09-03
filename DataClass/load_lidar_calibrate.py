@@ -41,6 +41,38 @@ def reshape_points(points, width,height):
 
     # Assign the points and colors to the point cloud
     return points_new, points_frame
+def read_point_cloud_fom_files_disc(file):
+
+    points_filename = file+".bin"
+    colors_filename = file+"_colors.bin"
+    textfile_name = file+ ".bin.txt"
+
+    # --- 1. Read Metadata First ---
+    # We must know the dimensions of the data before we can memory-map it.
+    width = height = frame_count = None
+    with open(textfile_name, "r") as textfile:
+        for line in textfile:
+            stripped_line = line.strip()
+            if stripped_line.startswith("width"):
+                width = int(stripped_line.split()[1])
+                height = int(stripped_line.split()[3])
+            elif stripped_line.startswith("numberOfFrames"):
+                frame_count = int(stripped_line.split()[1])
+
+    if not all((width, height, frame_count)):
+        raise ValueError("Could not read all required metadata (width, height, frame_count) from text file.")
+
+    # --- 2. Create Memory-Mapped Arrays ---
+    # Define the shape. Assuming 3 channels for XYZ points and RGB colors.
+    shape = (frame_count, height, width, 3)
+
+    # Create the memory-mapped array for points (read-only is safer if you don't modify it)
+    points_np = np.memmap(points_filename, dtype=np.float64, mode='r', shape=shape)
+
+    # Create the array for colors. Use 'r+' mode for reading AND writing.
+    colors_np = np.memmap(colors_filename, dtype=np.float64, mode='r+', shape=shape)
+
+    return points_np, colors_np
 
 
 def read_point_cloud_from_files(file):
