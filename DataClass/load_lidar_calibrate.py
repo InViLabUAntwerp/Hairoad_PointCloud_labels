@@ -64,7 +64,7 @@ def read_point_cloud_fom_files_disc(file):
 
     # --- 2. Create Memory-Mapped Arrays ---
     # Define the shape. Assuming 3 channels for XYZ points and RGB colors.
-    shape = (frame_count, height, width, 3)
+    shape = (frame_count, height, width)
 
     # Create the memory-mapped array for points (read-only is safer if you don't modify it)
     points_np = np.memmap(points_filename, dtype=np.float64, mode='r', shape=shape)
