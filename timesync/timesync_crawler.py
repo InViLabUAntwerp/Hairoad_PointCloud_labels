@@ -10,6 +10,7 @@ from timesync.timesync_helper import (
     process_sep_data_to_image,
     load_transformation_matrix,
     read_point_cloud_from_files,
+    read_point_cloud_fom_files_disc,
     save_as_ply,
     project_and_color_pointcloud_with_border
 )
@@ -44,13 +45,13 @@ def align_point_cloud_to_plane(pcd):
 
     [a, b, c, d] = plane_model
     plane_normal = np.array([a, b, c])
-    print(f"Detected Plane Equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
+    #print(f"Detected Plane Equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
 
     # 2. Center the point cloud at the origin
     # This fulfills the "put the origin in the middle" requirement.
     center = pcd.get_center()
     pcd.translate(-center)
-    print(f"Centered the point cloud by translating by {-center}")
+    #print(f"Centered the point cloud by translating by {-center}")
 
     # 3. Calculate the rotation matrix to align the plane normal with the Z-axis
     target_normal = np.array([0, 0, 1])
@@ -69,7 +70,7 @@ def align_point_cloud_to_plane(pcd):
 
     # 4. Apply the rotation
     pcd.rotate(rotation_matrix, center=(0, 0, 0))
-    print("Applied rotation to align plane with XY plane.")
+    #print("Applied rotation to align plane with XY plane.")
 
     return pcd
 
@@ -135,7 +136,8 @@ def process_master_file(master_timestamp_file, camera_search_dir, base_output_di
     print(f"\nLoading Lidar point cloud data from: {os.path.basename(lidar_data_file)}...")
     print("Loading may take a while...")
     try:
-        points_xyz_list, points_rgb_list = read_point_cloud_from_files(lidar_data_file)
+        points_xyz_list, points_rgb_list = read_point_cloud_fom_files_disc(lidar_data_file)
+        #points_xyz_list2, points_rgb_list2 = read_point_cloud_from_files(lidar_data_file)
         print("✅ Lidar data loaded.")
     except Exception as e:
         print(f"❌ Error loading Lidar data: {e}");
