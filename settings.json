@@ -1,11 +1,17 @@
 {
   "labels": [
+    "Asphalt",
+    "Concrete",
+    "Element",
     "Rutting",
     "Subsidence",
     "Pothole",
+    "Stepping",
     "Car",
     "Normal (Flat)",
     "Bad data"
+
+
   ],
   "labels_comment": "A list of strings that will appear as toggle buttons for labeling the data. The labels are saved in 'labels.csv'.",
   "xz_plot_z_limit_cm": 3,
