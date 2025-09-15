@@ -741,6 +741,13 @@ def project_and_color_pointcloud_with_border(image, transformation_matrix, intri
     # --- Mask for points inside the image ---
     mask_inside = (u >= 0) & (u < width) & (v >= 0) & (v < height) & valid_depth_mask
 
+    # Create a binary mask image from the projected points
+    projection_mask_image = np.zeros((height, width), dtype=np.uint8)
+    if np.any(mask_inside):
+        # Set pixels corresponding to projected points to white
+        projection_mask_image[v[mask_inside], u[mask_inside]] = 255
+    # save the image with opencv
+
     # OPTIMIZATION: Sample BGR colors first, then convert only the sample to RGB.
     if np.any(mask_inside):
         sampled_bgr = image[v[mask_inside], u[mask_inside]]
@@ -771,7 +778,7 @@ def project_and_color_pointcloud_with_border(image, transformation_matrix, intri
     if vis == 1:
         o3d.visualization.draw_geometries([pcd])
 
-    return final_colors, XYZ
+    return final_colors, XYZ,projection_mask_image
 
 
 
@@ -899,6 +906,3 @@ if __name__ == "__main__":
 
 
     # add a histogram slider
-
-
-

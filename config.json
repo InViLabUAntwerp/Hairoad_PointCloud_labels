@@ -1,7 +1,7 @@
 {
-    "master_dir": "E:\\backup Hairoad sync\\lablelsv2\\Sensorbox Raw Lidar Data\\2025-07-11_12-48-59",
-    "camera_dir": "E:\\backup Hairoad sync\\lablelsv2\\Sensorbox Raw Camera Data",
-    "output_dir": "E:\\backup Hairoad sync\\juli 2025\\synced_output6",
+    "master_dir": "E:\\Synchting\\lablelsv2\\Sensorbox Raw Lidar Data\\2025-07-11_12-48-59",
+    "camera_dir": "E:\\backup Hairoad sync\\lablelsv2\\Sensorbox Raw Camera Data\\2025-07-11_12-49-12",
+    "output_dir": "E:\\backup Hairoad sync\\august 2025\\synced_output_new3",
     "border": 100,
     "time_diff_threshold": 0.05
 }

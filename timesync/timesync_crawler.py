@@ -189,6 +189,21 @@ def process_master_file(master_timestamp_file, camera_search_dir, base_output_di
             undistorted_frame = Calibrator.camera_parameters.remap_image(processed_frame)
 
             jpeg_filename = master_dt.strftime("%Y%m%d%H%M%S%f") + ".jpg"
+            # if projection_mask_image exist, save it with the same name
+            if 'projection_mask_image' in locals():
+                jpeg_filename_p = master_dt.strftime("%Y%m%d%H%M%S%f_p") + ".jpg"
+                output_path = os.path.join(camera_output_directory,jpeg_filename_p)
+                # combine projection_mask_image and undistorted_frame by adding each pixel, clip
+                #make projection_mask_image RGB
+                #dilate the mask
+                projection_mask_image = cv2.dilate(projection_mask_image, np.ones((10,10), np.uint8), iterations = 1)
+
+                projection_mask_image = cv2.cvtColor(projection_mask_image, cv2.COLOR_GRAY2BGR)
+
+                combined_image = cv2.addWeighted(undistorted_frame, 0.7, projection_mask_image, 0.3, 0)
+
+                cv2.imwrite(output_path, combined_image)
+
             output_path = os.path.join(camera_output_directory, jpeg_filename)
             cv2.imwrite(output_path, undistorted_frame)
 
@@ -200,7 +215,7 @@ def process_master_file(master_timestamp_file, camera_search_dir, base_output_di
             if border is None:
                 colors, XYZ = project_and_color_pointcloud_with_border(undistorted_frame, transformation_matrix, intrinsics, XYZ, vis=0, border_size = 0)
             else:
-                colors, XYZ = project_and_color_pointcloud_with_border(undistorted_frame, transformation_matrix, intrinsics, XYZ,vis = 0, border_size=border)
+                colors, XYZ,projection_mask_image = project_and_color_pointcloud_with_border(undistorted_frame, transformation_matrix, intrinsics, XYZ,vis = 0, border_size=border)
             mask = ~np.all(colors == [0, 0, 0], axis=1)
             XYZ = XYZ[mask]
             colors = colors[mask]

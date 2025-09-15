@@ -4,8 +4,9 @@
 # This code is for internal use only (Uantwerpen, project members)
 # Bugs, bugfixes and additions to the code need to be reported to Invilab (contact: Seppe Sels)
 # GUI: AI generated
-# --- MODIFIED FOR PCD/PLY FILE VISUALIZATION WITH NORMALS & CUSTOM COLORS ---
-#
+# This script provides a GUI for visualizing PCD/PLY point cloud files,
+# including features for normal visualization, custom coloring, and profile analysis.
+
 
 import wx
 import numpy as np
@@ -16,7 +17,13 @@ import open3d as o3d
 import json
 import csv
 
-# --- ADDED: Imports for 3D Visualization ---
+# Optional import for LOWESS smoothing for profile fitting.
+
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+statsmodels_available = True
+
+# Imports for 3D visualization using VisPy.
 from vispy import scene
 from vispy.scene import cameras
 from vispy.scene.visuals import Text, Line
@@ -25,7 +32,7 @@ from vispy.color import Color, get_colormap
 # Add PIL import for image loading
 from PIL import Image
 
-# --- NEW: Add Matplotlib for histogram plotting ---
+# Imports for Matplotlib for histogram and profile plotting.
 # Note: This adds a new dependency. If building with cx_Freeze,
 # 'matplotlib' should be added to the packages list in setup.py.
 import matplotlib
@@ -70,72 +77,6 @@ def open_point_cloud_file(filepath):
         return None, None
 
 
-class XZPlotFrame(wx.Frame):
-    """A separate frame to display the X-Z scatter plot."""
-
-    def __init__(self, parent, title="X-Z Profile"):
-        super(XZPlotFrame, self).__init__(parent, title=title, size=(800, 600))
-        self.panel = wx.Panel(self)
-        self.figure = Figure()
-        self.axes = self.figure.add_subplot(111)
-        self.canvas = FigureCanvas(self.panel, -1, self.figure)
-
-        sizer = wx.BoxSizer(wx.VERTICAL)
-        sizer.Add(self.canvas, 1, wx.EXPAND)
-        self.panel.SetSizer(sizer)
-
-        self.Centre()
-
-    def update_plot(self, points, z_scale_factor):
-        if points is None or len(points) == 0:
-            self.axes.clear()
-            self.axes.text(0.5, 0.5, 'No points to display.', horizontalalignment='center', verticalalignment='center')
-            self.canvas.draw()
-            return
-
-        # Subsample if too many points to keep the plot responsive
-        if len(points) > 100000:
-            choice = np.random.choice(len(points), 100000, replace=False)
-            points_to_plot = points[choice]
-            plot_title = f"X-Z Profile (showing 100k of {len(points)} points)"
-        else:
-            points_to_plot = points
-            plot_title = f"X-Z Profile ({len(points)} points )"
-
-        x_coords = points_to_plot[:, 0]
-        z_coords = -points_to_plot[:, 2] / z_scale_factor * 100
-
-        self.axes.clear()
-        # Use plot with markers for performance
-        self.axes.plot(x_coords, z_coords, '.', markersize=2, alpha=0.7, label='Points')
-
-        # --- NEW: Calculate and plot 4th order polynomial trendline ---
-        # Ensure there are enough points to fit a 4th order polynomial
-        if len(x_coords) > 4:
-            try:
-                # Fit the polynomial
-                coeffs = np.polyfit(x_coords, z_coords, 20)
-                poly = np.poly1d(coeffs)
-
-                # Generate smooth x-values for the trendline
-                x_trend = np.linspace(x_coords.min(), x_coords.max(), 500)
-                z_trend = poly(x_trend)
-
-                # Plot the trendline
-                self.axes.plot(x_trend, z_trend, 'r-', linewidth=2, label='7th Order Trendline')
-                # self.axes.legend()  # Display the legend
-            except np.linalg.LinAlgError:
-                print("Could not fit polynomial trendline. The data may be poorly conditioned.")
-
-        self.axes.set_xlabel("X-coordinate (m)")
-        self.axes.set_ylabel(f"Z-coordinate (cm)")
-        self.axes.set_title(plot_title)
-        self.axes.grid(True)
-        self.axes.set_aspect('auto', adjustable='box')
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-
 class PCDViewerFrame(wx.Frame):
     def __init__(self, *args, filepath=None, **kw):
         super(PCDViewerFrame, self).__init__(*args, **kw)
@@ -146,11 +87,11 @@ class PCDViewerFrame(wx.Frame):
         self.show_normals = False
         self.show_colors = False
         self.flip_z = False
-        self.color_by_z = False
+        self.color_by_z = True  # Enable Z-coloring by default
         self.default_point_color = 'white'
 
-        # --- NEW: Y-clipping attributes ---
-        self.clip_by_y = True
+        # Y-clipping attributes
+        self.clip_by_y = False  # Disable Y-clipping by default for consistency
         self.y_data_min = 0.0
         self.y_data_max = 1.0
         self.y_clip_min = 0.0
@@ -158,7 +99,7 @@ class PCDViewerFrame(wx.Frame):
         self.y_min_slider = None
         self.y_max_slider = None
 
-        # --- NEW: Z-coloring range attributes ---
+        # Index-clipping attributes
         self.clip_by_index = False
         self.index_data_min = 0
         self.index_data_max = 1
@@ -174,7 +115,7 @@ class PCDViewerFrame(wx.Frame):
         self.z_min_slider = None
         self.z_max_slider = None
 
-        # --- NEW: Z-Scale attributes ---
+        # Z-Scale attributes
         self.z_scale_factor = 1.0
         self.z_scale_slider = None
 
@@ -201,21 +142,71 @@ class PCDViewerFrame(wx.Frame):
         self.hist_min_line = None
         self.hist_max_line = None
 
-        # --- NEW: XZ Plot attributes ---
-        self.show_xz_plot_button = None
-        self.xz_plot_frame = None
+        # XZ Profile Plot attributes
+        self.xz_canvas = None
+        self.xz_figure = None
+        self.xz_axes = None
+        self.xz_plot_z_limit = 10  # Default limit in cm, +/- this value
+        self.xz_plot_y_sections = 4  # Default number of Y-sections
+        self.xz_plot_use_sections = True  # Default to showing the sectioned plot
+        self.xz_z_min_ctrl = None
+        self.xz_z_max_ctrl = None
+        self.xz_plot_z_min = -10
+        self.xz_plot_z_max = 10
+        self.xz_plot_remove_outliers = True
+        self.xz_plot_fit_method = "LOWESS" if statsmodels_available else "Polynomial"
+        self.xz_plot_lowess_frac = 0.2
+        self.fit_method_choice = None
+        self.xz_plot_outlier_iqr_factor = 1.5
+        self.xz_remove_outliers_button = None
+        self.xz_plot_min_x_span_m = 1.5
 
-        # --- MODIFIED: Labeling attributes ---
+        # XZ plot X-axis limit attributes
+        self.xz_plot_fix_x_axis = False
+        self.xz_plot_x_min = -2.0
+        self.xz_plot_x_max = 2.0
+        self.xz_fix_x_axis_button = None
+        self.xz_x_min_ctrl = None
+        self.xz_x_max_ctrl = None
+
+        # XZ plot state management for undoing axis changes
+        self.xz_plot_z_min_default, self.xz_plot_z_max_default = -10, 10
+        self.xz_plot_x_min_default, self.xz_plot_x_max_default = -2.0, 2.0
+        self.xz_plot_fix_x_axis_default = False
+        self.xz_plot_z_min_prev, self.xz_plot_z_max_prev = -10, 10
+        self.xz_plot_x_min_prev, self.xz_plot_x_max_prev = -2.0, 2.0
+        self.xz_plot_fix_x_axis_prev = False
+        self.xz_previous_settings_available = False
+        self.xz_autoscale_button = None
+        self.xz_defaults_button = None
+        self.xz_previous_button = None
+        self.xz_plot_section_gap_m = 0.02
+
+        # 3D View Grid attributes
+        self.show_grid = True
+        self.grid_spacing = 1.0  # meters
+        self.grid_visual = None
+        self.show_grid_item = None
+
+        # Point style attributes
+        self.point_symbol = 'disc'
+        self.symbol_choice = None
+
+        # Labeling attributes
         self.labels = []
         self.label_buttons = {}
 
-        # --- NEW: Image display attributes ---
+        # Image display attributes
         self.image_panel = None
         self.corresponding_image = None  # This will be a wx.Bitmap
+        self.projected_image = None  # This will be the _p.jpg image
+
+        # Projection attributes
+        self.show_projection = False
+        self.projection_button = None
 
         self.InitUI()
         self.Maximize()
-        self.LoadSettings()
         self.Show()
 
         if filepath:
@@ -229,22 +220,105 @@ class PCDViewerFrame(wx.Frame):
             if os.path.exists(settings_path):
                 with open(settings_path, 'r') as f:
                     settings = json.load(f)
-                    # Ensure labels is a list of strings
-                    if 'labels' in settings and isinstance(settings['labels'], list):
-                        self.labels = [str(label) for label in settings['labels']]
-                        if not self.labels:  # If list is empty
-                            self.labels = default_labels
-                            print("Warning: 'labels' in settings.json is empty. Using default labels.")
+                    # Safely load labels
+                    loaded_labels = settings.get('labels', default_labels)
+                    if isinstance(loaded_labels, list) and loaded_labels:
+                        self.labels = [str(label) for label in loaded_labels]
                     else:
                         self.labels = default_labels
-                        print("Warning: 'labels' key not found or not a list in settings.json. Using default labels.")
+
+                    # Safely load XZ plot Z-limit
+                    limit = settings.get('xz_plot_z_limit_cm')
+                    if limit is not None and isinstance(limit, (int, float)):
+                        self.xz_plot_z_limit = abs(limit)
+                        # Also update the dynamic min/max values
+                        self.xz_plot_z_min = -self.xz_plot_z_limit
+                        self.xz_plot_z_max = self.xz_plot_z_limit
+                    self.xz_plot_z_min_default = self.xz_plot_z_min
+                    self.xz_plot_z_max_default = self.xz_plot_z_max
+                    self.xz_plot_z_min_prev = self.xz_plot_z_min
+                    self.xz_plot_z_max_prev = self.xz_plot_z_max
+
+                    # Safely load number of Y sections for XZ plot
+                    sections = settings.get('xz_plot_y_sections')
+                    if sections is not None and isinstance(sections, int) and sections > 0:
+                        self.xz_plot_y_sections = sections
+
+                    # Safely load outlier removal settings
+                    remove_outliers = settings.get('xz_plot_remove_outliers')
+                    if isinstance(remove_outliers, bool):
+                        self.xz_plot_remove_outliers = remove_outliers
+
+                    iqr_factor = settings.get('xz_plot_outlier_iqr_factor')
+                    if iqr_factor is not None and isinstance(iqr_factor, (int, float)) and iqr_factor > 0:
+                        self.xz_plot_outlier_iqr_factor = iqr_factor
+
+                    # Safely load fit method settings
+                    fit_method = settings.get('xz_plot_fit_method', "LOWESS")
+                    if fit_method == "LOWESS" and not statsmodels_available:
+                        print(
+                            "Warning: 'LOWESS' fit method selected but statsmodels is not installed. Falling back to 'Polynomial'.")
+                        self.xz_plot_fit_method = "Polynomial"
+                    else:
+                        self.xz_plot_fit_method = fit_method
+
+                    # Safely load min x-span for XZ plot
+                    min_span = settings.get('xz_plot_min_x_span_m')
+                    if min_span is not None and isinstance(min_span, (int, float)) and min_span >= 0:
+                        self.xz_plot_min_x_span_m = min_span
+
+                    # Safely load X-axis limit settings
+                    self.xz_plot_fix_x_axis = bool(settings.get('xz_plot_fix_x_axis', False))
+                    x_limit = settings.get('xz_plot_x_limit_m')
+                    if x_limit is not None and isinstance(x_limit, (int, float)):
+                        self.xz_plot_x_min = -abs(x_limit)
+                        self.xz_plot_x_max = abs(x_limit)
+                    self.xz_plot_fix_x_axis_default = self.xz_plot_fix_x_axis
+                    self.xz_plot_x_min_default = self.xz_plot_x_min
+                    self.xz_plot_x_max_default = self.xz_plot_x_max
+                    self.xz_plot_fix_x_axis_prev = self.xz_plot_fix_x_axis
+                    self.xz_plot_x_min_prev = self.xz_plot_x_min
+                    self.xz_plot_x_max_prev = self.xz_plot_x_max
+
+                    # Safely load section gap setting
+                    gap_m = settings.get('xz_plot_section_gap_m')
+                    if gap_m is not None and isinstance(gap_m, (int, float)) and gap_m > 0:
+                        self.xz_plot_section_gap_m = gap_m
+
+                    # Safely load grid settings
+                    self.show_grid = bool(settings.get('view_show_grid', True))
+                    grid_spacing = settings.get('view_grid_spacing_m')
+                    if grid_spacing is not None and isinstance(grid_spacing, (int, float)) and grid_spacing > 0:
+                        self.grid_spacing = grid_spacing
+
+                    self.xz_plot_lowess_frac = float(settings.get('xz_plot_lowess_frac', 0.2))
+
             else:
                 self.labels = default_labels
         except (json.JSONDecodeError, Exception) as e:
             self.labels = default_labels
-            print(f"Error loading settings.json: {e}. Using default labels.")
+            self.xz_plot_z_limit = 10
+            self.xz_plot_z_min = -10
+            self.xz_plot_z_max = 10
+            self.xz_plot_y_sections = 4
+            self.xz_plot_remove_outliers = True  # Keep this for consistency
+            self.xz_plot_fit_method = "LOWESS" if statsmodels_available else "Polynomial"
+            self.xz_plot_min_x_span_m = 1.5
+            self.xz_plot_fix_x_axis = False
+            self.xz_plot_x_min = -2.0
+            self.xz_plot_x_max = 2.0
+            self.xz_plot_z_min_default, self.xz_plot_z_max_default = self.xz_plot_z_min, self.xz_plot_z_max
+            self.xz_plot_x_min_default, self.xz_plot_x_max_default = self.xz_plot_x_min, self.xz_plot_x_max
+            self.xz_plot_fix_x_axis_default = self.xz_plot_fix_x_axis
+            self.xz_plot_section_gap_m = 0.02
+            self.show_grid = True
+            self.grid_spacing = 1.0
+            self.xz_plot_min_x_span_m = 1.5
+            self.xz_plot_lowess_frac = 0.2
+            print(f"Error loading settings.json: {e}. Using default labels and plot settings.")
 
     def InitUI(self):
+        self.LoadSettings()
         self.SetTitle("Point Cloud Viewer | InViLab - UAntwerpen")
         try:
             icon_path = resource_path("genpycam.ico")
@@ -285,6 +359,11 @@ class PCDViewerFrame(wx.Frame):
                                          "Choose a color for points without color data")
         self.dark_bg_item = viewMenu.Append(wx.ID_ANY, "Dark Background", "Toggle dark background", kind=wx.ITEM_CHECK)
 
+        # Add grid toggle to View menu
+        self.show_grid_item = viewMenu.Append(wx.ID_ANY, "Show Grid\tCtrl+G",
+                                              "Toggle visibility of the ground grid", kind=wx.ITEM_CHECK)
+        self.show_grid_item.Check(self.show_grid)
+
         viewMenu.AppendSeparator()
         self.calculate_normals_item = viewMenu.Append(wx.ID_ANY, "Calculate Normals",
                                                       "Estimate normals for the point cloud")
@@ -299,16 +378,112 @@ class PCDViewerFrame(wx.Frame):
         self.panel = wx.Panel(self)
         main_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
+        # Left panel for XZ profile plot
+        xz_panel = wx.Panel(self.panel)
+        xz_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.xz_figure = Figure(figsize=(4, 6), dpi=100)
+        self.xz_axes = self.xz_figure.add_subplot(111)
+        self.xz_canvas = FigureCanvas(xz_panel, -1, self.xz_figure)
+        self.xz_canvas.Enable(False)
+        xz_sizer.Add(self.xz_canvas, 1, wx.EXPAND | wx.ALL, 5)
+
+        # XZ plot control buttons
+        plot_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.xz_plot_sections_button = wx.ToggleButton(xz_panel, label="Y-Sections")
+        self.xz_plot_sections_button.SetValue(self.xz_plot_use_sections)
+        self.xz_plot_sections_button.Enable(False)
+        plot_controls_sizer.Add(self.xz_plot_sections_button, 1, wx.EXPAND | wx.RIGHT, 2)
+
+        self.xz_remove_outliers_button = wx.ToggleButton(xz_panel, label="Remove Outliers")
+        self.xz_remove_outliers_button.SetValue(self.xz_plot_remove_outliers)
+        self.xz_remove_outliers_button.Enable(False)
+        plot_controls_sizer.Add(self.xz_remove_outliers_button, 1, wx.EXPAND | wx.LEFT, 2)
+        xz_sizer.Add(plot_controls_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # XZ plot axis control buttons
+        axis_controls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.xz_autoscale_button = wx.Button(xz_panel, label="Autoscale")
+        self.xz_autoscale_button.Enable(False)
+        axis_controls_sizer.Add(self.xz_autoscale_button, 1, wx.EXPAND | wx.RIGHT, 2)
+
+        self.xz_defaults_button = wx.Button(xz_panel, label="Defaults")
+        self.xz_defaults_button.Enable(False)
+        axis_controls_sizer.Add(self.xz_defaults_button, 1, wx.EXPAND | wx.RIGHT, 2)
+
+        self.xz_previous_button = wx.Button(xz_panel, label="Previous")
+        self.xz_previous_button.Enable(False)
+        axis_controls_sizer.Add(self.xz_previous_button, 1, wx.EXPAND)
+        xz_sizer.Add(axis_controls_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # Dropdown for selecting the profile fitting method
+        fit_method_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        fit_method_sizer.Add(wx.StaticText(xz_panel, label="Fit Method:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        fit_choices = ["Polynomial"]
+        if statsmodels_available:
+            fit_choices.append("LOWESS")
+        self.fit_method_choice = wx.Choice(xz_panel, choices=fit_choices)
+        self.fit_method_choice.SetStringSelection(self.xz_plot_fit_method)
+        self.fit_method_choice.Enable(False)
+        fit_method_sizer.Add(self.fit_method_choice, 1, wx.EXPAND)
+        xz_sizer.Add(fit_method_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # Text controls for XZ plot Z-axis range for precision
+        z_range_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        z_range_sizer.Add(wx.StaticText(xz_panel, label="Z-Range (cm):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.xz_z_min_ctrl = wx.TextCtrl(xz_panel, value=str(self.xz_plot_z_min), size=(50, -1),
+                                         style=wx.TE_PROCESS_ENTER)
+        self.xz_z_min_ctrl.Enable(False)
+        z_range_sizer.Add(self.xz_z_min_ctrl, 1, wx.EXPAND | wx.RIGHT, 2)
+
+        z_range_sizer.Add(wx.StaticText(xz_panel, label="to"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 2)
+
+        self.xz_z_max_ctrl = wx.TextCtrl(xz_panel, value=str(self.xz_plot_z_max), size=(50, -1),
+                                         style=wx.TE_PROCESS_ENTER)
+        self.xz_z_max_ctrl.Enable(False)
+        z_range_sizer.Add(self.xz_z_max_ctrl, 1, wx.EXPAND)
+        xz_sizer.Add(z_range_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # Controls for XZ plot X-axis range
+        self.xz_fix_x_axis_button = wx.ToggleButton(xz_panel, label="Fix X-Axis")
+        self.xz_fix_x_axis_button.SetValue(self.xz_plot_fix_x_axis)
+        self.xz_fix_x_axis_button.Enable(False)
+        xz_sizer.Add(self.xz_fix_x_axis_button, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        x_range_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        x_range_sizer.Add(wx.StaticText(xz_panel, label="X-Range (m):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+
+        self.xz_x_min_ctrl = wx.TextCtrl(xz_panel, value=str(self.xz_plot_x_min), size=(50, -1),
+                                         style=wx.TE_PROCESS_ENTER)
+        self.xz_x_min_ctrl.Enable(self.xz_plot_fix_x_axis)
+        x_range_sizer.Add(self.xz_x_min_ctrl, 1, wx.EXPAND | wx.RIGHT, 2)
+
+        x_range_sizer.Add(wx.StaticText(xz_panel, label="to"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT | wx.RIGHT, 2)
+
+        self.xz_x_max_ctrl = wx.TextCtrl(xz_panel, value=str(self.xz_plot_x_max), size=(50, -1),
+                                         style=wx.TE_PROCESS_ENTER)
+        self.xz_x_max_ctrl.Enable(self.xz_plot_fix_x_axis)
+        x_range_sizer.Add(self.xz_x_max_ctrl, 1, wx.EXPAND)
+        xz_sizer.Add(x_range_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        xz_panel.SetSizer(xz_sizer)
+        main_sizer.Add(xz_panel, 1, wx.EXPAND)
+
         self.canvas = scene.SceneCanvas(parent=self.panel, keys='interactive', show=True, bgcolor='lightpink')
         self.view = self.canvas.central_widget.add_view()
-        # --- MODIFIED: Switched to TurntableCamera for more stable rotation and clipping ---
+        # Use an ArcballCamera for intuitive rotation and stable clipping.
         self.view.camera = cameras.ArcballCamera(fov=45, distance=10, up='+z')
 
-        # --- FIX: Bind key handler directly to the VisPy canvas widget ---
+        # Bind key handler directly to the VisPy canvas widget to capture navigation keys.
         self.canvas.native.Bind(wx.EVT_KEY_DOWN, self.OnKeyDown)
 
         scene.visuals.XYZAxis(parent=self.view.scene)
         self.markers = scene.visuals.Markers(parent=self.view.scene)
+
+        # Create the grid visual as a Line visual.
+        self.grid_visual = Line(parent=self.view.scene, method='gl', width=1)
+        self.grid_visual.visible = False
+
         self.normals_visual = Line(parent=self.view.scene, method='gl', width=1)
         self.normals_visual.visible = False
 
@@ -318,6 +493,8 @@ class PCDViewerFrame(wx.Frame):
             "RMB / Scroll: Zoom\n"
             "Shift + LMB: Pan\n"
             "Shift + RMB: FOV\n"
+            "ctrl + h: Show histogram colors"
+            "ctrl + c: Show RGB colors"
             "'n' / 'p': Next/Prev File"
         )
         self.controls_overlay = Text(
@@ -348,20 +525,25 @@ class PCDViewerFrame(wx.Frame):
         self.canvas.events.resize.connect(self.OnCanvasResize)
         self.OnCanvasResize(None)
 
-        # --- MODIFIED: Major UI layout change ---
-        # Left side is the 3D canvas, right side is a new controls panel
-        main_sizer.Add(self.canvas.native, 3, wx.EXPAND)
+        # Main UI layout: XZ plot on the left, 3D canvas in the middle, controls on the right.
+        main_sizer.Add(self.canvas.native, 2, wx.EXPAND)
 
         controls_panel = wx.Panel(self.panel)
         controls_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # --- NEW: Image Display Panel ---
+        # Image Display Panel
         self.image_panel = wx.Panel(controls_panel, style=wx.BORDER_SUNKEN)
         self.image_panel.SetBackgroundColour(wx.BLACK)
         self.image_panel.SetMinSize((-1, 200))  # Give it some initial size
         controls_sizer.Add(self.image_panel, 1, wx.EXPAND | wx.ALL, 5)
 
-        # --- NEW: Histogram Plot ---
+        # Projection Button
+        self.projection_button = wx.ToggleButton(controls_panel, label="Show Projected Image")
+        self.projection_button.SetValue(self.show_projection)
+        self.projection_button.Enable(False)
+        controls_sizer.Add(self.projection_button, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # Histogram Plot
         self.hist_figure = Figure(figsize=(4, 3), dpi=100)
         self.hist_axes = self.hist_figure.add_subplot(111)
         self.hist_canvas = FigureCanvas(controls_panel, -1, self.hist_figure)
@@ -371,12 +553,22 @@ class PCDViewerFrame(wx.Frame):
         # Point Size Slider
         ps_sizer = wx.BoxSizer(wx.HORIZONTAL)
         ps_sizer.Add(wx.StaticText(controls_panel, label="Point Size:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
-        self.point_size_slider = wx.Slider(controls_panel, value=3, minValue=1, maxValue=20)
+        self.point_size_slider = wx.Slider(controls_panel, value=10, minValue=1, maxValue=20)
         self.point_size_slider.Enable(False)
         ps_sizer.Add(self.point_size_slider, 1, wx.EXPAND)
         controls_sizer.Add(ps_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- NEW: Z-Min/Max Sliders ---
+        # Point Style Controls
+        style_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        style_sizer.Add(wx.StaticText(controls_panel, label="Point Style:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.symbol_choice = wx.Choice(controls_panel, choices=['disc', 'square', 'diamond', 'cross'])
+        self.symbol_choice.SetStringSelection('disc')
+        self.symbol_choice.Enable(False)
+        style_sizer.Add(self.symbol_choice, 1, wx.EXPAND | wx.RIGHT, 5)
+
+        controls_sizer.Add(style_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # Z-Min/Max Sliders for coloring
         z_min_sizer = wx.BoxSizer(wx.HORIZONTAL)
         z_min_sizer.Add(wx.StaticText(controls_panel, label="Z-Min:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         self.z_min_slider = wx.Slider(controls_panel, value=0, minValue=0, maxValue=1000)
@@ -391,7 +583,7 @@ class PCDViewerFrame(wx.Frame):
         z_max_sizer.Add(self.z_max_slider, 1, wx.EXPAND)
         controls_sizer.Add(z_max_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- NEW: Z-Scale Slider ---
+        # Z-Scale Slider
         z_scale_sizer = wx.BoxSizer(wx.HORIZONTAL)
         z_scale_sizer.Add(wx.StaticText(controls_panel, label="Z-Scale:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         # Slider from 10 to 200, representing 1.0x to 20.0x scale
@@ -400,7 +592,7 @@ class PCDViewerFrame(wx.Frame):
         z_scale_sizer.Add(self.z_scale_slider, 1, wx.EXPAND)
         controls_sizer.Add(z_scale_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- NEW: Y-Clip Min/Max Sliders ---
+        # Y-Clip Min/Max Sliders
         y_min_sizer = wx.BoxSizer(wx.HORIZONTAL)
         y_min_sizer.Add(wx.StaticText(controls_panel, label="Y-Clip Min:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         self.y_min_slider = wx.Slider(controls_panel, value=0, minValue=0, maxValue=1000)
@@ -415,7 +607,7 @@ class PCDViewerFrame(wx.Frame):
         y_max_sizer.Add(self.y_max_slider, 1, wx.EXPAND)
         controls_sizer.Add(y_max_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- NEW: Index Clip Min/Max Sliders ---
+        # Index Clip Min/Max Sliders
         index_min_sizer = wx.BoxSizer(wx.HORIZONTAL)
         index_min_sizer.Add(wx.StaticText(controls_panel, label="Index Min:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
                             5)
@@ -432,15 +624,9 @@ class PCDViewerFrame(wx.Frame):
         index_max_sizer.Add(self.index_max_slider, 1, wx.EXPAND)
         controls_sizer.Add(index_max_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
-        # --- NEW: X-Z Profile Plot Button ---
-        self.show_xz_plot_button = wx.Button(controls_panel, label="Show X-Z Profile")
-        self.show_xz_plot_button.Enable(False)
-        controls_sizer.Add(self.show_xz_plot_button, 0, wx.EXPAND | wx.ALL, 5)
-
-        # --- MODIFIED: Labeling Buttons ---
+        # Labeling Buttons
         label_box = wx.StaticBox(controls_panel, label="Label Data")
         # Use a grid sizer for flexible layout
-        self.LoadSettings()
         label_grid_sizer = wx.GridSizer(rows=0, cols=2, vgap=2, hgap=2)
 
         for label_text in self.labels:
@@ -477,15 +663,44 @@ class PCDViewerFrame(wx.Frame):
         self.Bind(wx.EVT_SLIDER, self.OnYSliderChange, self.y_max_slider)
         self.Bind(wx.EVT_SLIDER, self.OnIndexSliderChange, self.index_min_slider)
         self.Bind(wx.EVT_SLIDER, self.OnIndexSliderChange, self.index_max_slider)
-        self.Bind(wx.EVT_BUTTON, self.OnShowXZPlot, self.show_xz_plot_button)
+        self.Bind(wx.EVT_TOGGLEBUTTON, self.OnToggleXZSections, self.xz_plot_sections_button)
+        self.Bind(wx.EVT_TOGGLEBUTTON, self.OnToggleRemoveOutliers, self.xz_remove_outliers_button)
+        self.Bind(wx.EVT_CHOICE, self.OnFitMethodChange, self.fit_method_choice)
 
-        # --- MODIFIED: Bind Labeling Buttons ---
+        # Bindings for XZ axis control buttons
+        self.Bind(wx.EVT_BUTTON, self.OnXZAutoscale, self.xz_autoscale_button)
+        self.Bind(wx.EVT_BUTTON, self.OnXZResetToDefaults, self.xz_defaults_button)
+        self.Bind(wx.EVT_BUTTON, self.OnXZRevertToPrevious, self.xz_previous_button)
+
+        # Bindings for XZ Range Text Controls
+        self.Bind(wx.EVT_TEXT_ENTER, self.OnXZRangeChange, self.xz_z_min_ctrl)
+        self.Bind(wx.EVT_TEXT_ENTER, self.OnXZRangeChange, self.xz_z_max_ctrl)
+        self.xz_z_min_ctrl.Bind(wx.EVT_KILL_FOCUS, self.OnXZRangeChange)
+        self.xz_z_max_ctrl.Bind(wx.EVT_KILL_FOCUS, self.OnXZRangeChange)
+
+        # Bindings for XZ X-Range Controls
+        self.Bind(wx.EVT_TOGGLEBUTTON, self.OnToggleFixXAxis, self.xz_fix_x_axis_button)
+        self.Bind(wx.EVT_TEXT_ENTER, self.OnXRangeChange, self.xz_x_min_ctrl)
+        self.Bind(wx.EVT_TEXT_ENTER, self.OnXRangeChange, self.xz_x_max_ctrl)
+        self.xz_x_min_ctrl.Bind(wx.EVT_KILL_FOCUS, self.OnXRangeChange)
+        self.xz_x_max_ctrl.Bind(wx.EVT_KILL_FOCUS, self.OnXRangeChange)
+
+        # Bind Labeling Buttons
         for button in self.label_buttons.values():
             self.Bind(wx.EVT_TOGGLEBUTTON, self.OnLabelToggle, button)
         self.Bind(wx.EVT_MENU, self.OnCalculateNormals, self.calculate_normals_item)
         self.Bind(wx.EVT_MENU, self.OnShowNormals, self.show_normals_item)
         self.Bind(wx.EVT_MENU, self.OnToggleBackground, self.dark_bg_item)
         self.Bind(wx.EVT_MENU, self.OnSetPointColor, set_color_item)
+        # Bind grid toggle
+        self.Bind(wx.EVT_MENU, self.OnToggleGrid, self.show_grid_item)
+
+        # Bind point style controls
+        self.Bind(wx.EVT_CHOICE, self.OnSymbolChange, self.symbol_choice)
+
+        # Bind projection button
+        self.Bind(wx.EVT_TOGGLEBUTTON, self.OnToggleProjection, self.projection_button)
+
         self.image_panel.Bind(wx.EVT_PAINT, self.OnPaintImage)
         self.image_panel.Bind(wx.EVT_SIZE, self.OnSizeImage)
 
@@ -539,7 +754,7 @@ class PCDViewerFrame(wx.Frame):
 
     def OnResetView(self, event=None):
         if self.view and self.points is not None and len(self.points) > 0:
-            # --- MODIFIED: Use a scaled copy for calculating camera position ---
+            # Use a scaled copy for calculating camera position
             pts = self.points.copy()
             if self.z_scale_factor != 1.0:
                 # Scale relative to the mean to keep the cloud centered
@@ -555,7 +770,7 @@ class PCDViewerFrame(wx.Frame):
             self.view.camera.azimuth = 45
             self.view.camera.elevation = 30
 
-            # --- NEW: Manually set clipping planes for better rendering ---
+            # Manually set clipping planes for better rendering.
             # This prevents points from disappearing when rotating the camera.
             self.view.camera.near = distance / 1000.0
             self.view.camera.far = distance + max_extent * 2.0
@@ -565,7 +780,7 @@ class PCDViewerFrame(wx.Frame):
 
     def OnToggleColors(self, event):
         self.show_colors = event.IsChecked()
-        # --- NEW: Ensure color modes are mutually exclusive ---
+        # Ensure color modes are mutually exclusive
         if self.show_colors:
             self.color_by_z = False
             self.color_by_z_item.Check(False)
@@ -581,7 +796,7 @@ class PCDViewerFrame(wx.Frame):
         self.z_max_slider.Enable(is_enabled)
         self.hist_canvas.Enable(is_enabled)
 
-        # --- NEW: Ensure color modes are mutually exclusive ---
+        # Ensure color modes are mutually exclusive
         if self.color_by_z:
             self.show_colors = False
             self.toggle_colors_item.Check(False)
@@ -661,6 +876,180 @@ class PCDViewerFrame(wx.Frame):
         # Map slider value (10-200) to scale factor (1.0-20.0)
         self.z_scale_factor = slider_val / 10.0
         self.UpdateDisplay()
+        if self.canvas:
+            self.canvas.native.SetFocus()
+
+    def _store_previous_xz_settings(self):
+        """Saves the current XZ plot axis settings to the 'previous' state."""
+        self.xz_plot_z_min_prev = self.xz_plot_z_min
+        self.xz_plot_z_max_prev = self.xz_plot_z_max
+        self.xz_plot_x_min_prev = self.xz_plot_x_min
+        self.xz_plot_x_max_prev = self.xz_plot_x_max
+        self.xz_plot_fix_x_axis_prev = self.xz_plot_fix_x_axis
+        self.xz_previous_settings_available = True
+        if self.xz_previous_button:
+            self.xz_previous_button.Enable(True)
+
+    def OnXZRangeChange(self, event):
+        """Handles changes from the XZ-Plot Z-Min and Z-Max text controls."""
+        self._store_previous_xz_settings()
+        try:
+            min_val = float(self.xz_z_min_ctrl.GetValue())
+            max_val = float(self.xz_z_max_ctrl.GetValue())
+        except ValueError:
+            # If input is not a valid number, revert to the last known good values
+            self.xz_z_min_ctrl.SetValue(f"{self.xz_plot_z_min:.2f}")
+            self.xz_z_max_ctrl.SetValue(f"{self.xz_plot_z_max:.2f}")
+            print("Invalid input for Z-Range. Please enter numbers only.")
+            # Allow focus to change away from the bad input, but consume Enter presses.
+            if isinstance(event, wx.FocusEvent):
+                event.Skip()
+            return
+
+        if min_val > max_val:
+            # Swap if min is greater than max
+            min_val, max_val = max_val, min_val
+
+        self.xz_plot_z_min = min_val
+        self.xz_plot_z_max = max_val
+
+        # Update controls to reflect validated/swapped values, formatted nicely
+        self.xz_z_min_ctrl.SetValue(f"{self.xz_plot_z_min:.2f}")
+        self.xz_z_max_ctrl.SetValue(f"{self.xz_plot_z_max:.2f}")
+
+        self.UpdateXZPlot()
+        # Allow focus to change for EVT_KILL_FOCUS, but consume EVT_TEXT_ENTER
+        if isinstance(event, wx.FocusEvent):
+            event.Skip()
+
+    def OnToggleFixXAxis(self, event):
+        """Toggles fixing the X-axis on the XZ profile plot."""
+        self._store_previous_xz_settings()
+        self.xz_plot_fix_x_axis = event.IsChecked()
+        self.xz_x_min_ctrl.Enable(self.xz_plot_fix_x_axis)
+        self.xz_x_max_ctrl.Enable(self.xz_plot_fix_x_axis)
+        self.UpdateXZPlot()
+        if self.canvas:
+            self.canvas.native.SetFocus()
+
+    def OnXRangeChange(self, event):
+        """Handles changes from the XZ-Plot X-Min and X-Max text controls."""
+        self._store_previous_xz_settings()
+        try:
+            min_val = float(self.xz_x_min_ctrl.GetValue())
+            max_val = float(self.xz_x_max_ctrl.GetValue())
+        except ValueError:
+            self.xz_x_min_ctrl.SetValue(f"{self.xz_plot_x_min:.2f}")
+            self.xz_x_max_ctrl.SetValue(f"{self.xz_plot_x_max:.2f}")
+            print("Invalid input for X-Range. Please enter numbers only.")
+            # Allow focus to change away from the bad input, but consume Enter presses.
+            if isinstance(event, wx.FocusEvent):
+                event.Skip()
+            return
+
+        if min_val > max_val:
+            min_val, max_val = max_val, min_val
+
+        self.xz_plot_x_min = min_val
+        self.xz_plot_x_max = max_val
+
+        self.xz_x_min_ctrl.SetValue(f"{self.xz_plot_x_min:.2f}")
+        self.xz_x_max_ctrl.SetValue(f"{self.xz_plot_x_max:.2f}")
+
+        # Only update if the axis is fixed
+        if self.xz_plot_fix_x_axis:
+            self.UpdateXZPlot()
+        # Allow focus to change for EVT_KILL_FOCUS, but consume EVT_TEXT_ENTER
+        if isinstance(event, wx.FocusEvent):
+            event.Skip()
+
+    def _update_xz_controls_from_state(self):
+        """Updates the XZ plot control widgets to match the current state attributes."""
+        self.xz_z_min_ctrl.SetValue(f"{self.xz_plot_z_min:.2f}")
+        self.xz_z_max_ctrl.SetValue(f"{self.xz_plot_z_max:.2f}")
+        self.xz_x_min_ctrl.SetValue(f"{self.xz_plot_x_min:.2f}")
+        self.xz_x_max_ctrl.SetValue(f"{self.xz_plot_x_max:.2f}")
+        self.xz_fix_x_axis_button.SetValue(self.xz_plot_fix_x_axis)
+        self.xz_x_min_ctrl.Enable(self.xz_plot_fix_x_axis)
+        self.xz_x_max_ctrl.Enable(self.xz_plot_fix_x_axis)
+
+    def OnXZAutoscale(self, event):
+        """Autoscales the XZ plot to fit the currently visible data."""
+        if self.points is None:
+            return
+
+        # Get the currently visible points, same logic as in UpdateXZPlot
+        visible_mask = np.ones(len(self.points), dtype=bool)
+        if self.clip_by_y:
+            visible_mask &= (self.points[:, 1] >= self.y_clip_min) & (self.points[:, 1] <= self.y_clip_max)
+        if self.clip_by_index:
+            indices = np.arange(len(self.points))
+            visible_mask &= (indices >= self.index_clip_min) & (indices <= self.index_clip_max)
+        points_to_show = self.points[visible_mask]
+
+        if len(points_to_show) < 2:
+            return
+
+        self._store_previous_xz_settings()
+
+        x_coords = points_to_show[:, 0]
+        z_coords = -points_to_show[:, 2] / self.z_scale_factor * 100
+
+        x_min, x_max = np.min(x_coords), np.max(x_coords)
+        z_min, z_max = np.min(z_coords), np.max(z_coords)
+
+        # Add a 5% margin
+        x_margin = (x_max - x_min) * 0.05 if (x_max - x_min) > 1e-6 else 0.1
+        z_margin = (z_max - z_min) * 0.05 if (z_max - z_min) > 1e-6 else 0.1
+
+        self.xz_plot_x_min, self.xz_plot_x_max = x_min - x_margin, x_max + x_margin
+        self.xz_plot_z_min, self.xz_plot_z_max = z_min - z_margin, z_max + z_margin
+        self.xz_plot_fix_x_axis = True  # Autoscaling implies fixing the axis to the new range
+
+        self._update_xz_controls_from_state()
+        self.UpdateXZPlot()
+
+    def OnXZResetToDefaults(self, event):
+        """Resets the XZ plot axes to their default values from settings."""
+        self._store_previous_xz_settings()
+        self.xz_plot_z_min, self.xz_plot_z_max = self.xz_plot_z_min_default, self.xz_plot_z_max_default
+        self.xz_plot_x_min, self.xz_plot_x_max = self.xz_plot_x_min_default, self.xz_plot_x_max_default
+        self.xz_plot_fix_x_axis = self.xz_plot_fix_x_axis_default
+        self._update_xz_controls_from_state()
+        self.UpdateXZPlot()
+
+    def OnXZRevertToPrevious(self, event):
+        """Reverts the XZ plot axes to their previous settings."""
+        if not self.xz_previous_settings_available:
+            return
+        # Swap current and previous settings
+        (self.xz_plot_z_min, self.xz_plot_z_min_prev) = (self.xz_plot_z_min_prev, self.xz_plot_z_min)
+        (self.xz_plot_z_max, self.xz_plot_z_max_prev) = (self.xz_plot_z_max_prev, self.xz_plot_z_max)
+        (self.xz_plot_x_min, self.xz_plot_x_min_prev) = (self.xz_plot_x_min_prev, self.xz_plot_x_min)
+        (self.xz_plot_x_max, self.xz_plot_x_max_prev) = (self.xz_plot_x_max_prev, self.xz_plot_x_max)
+        (self.xz_plot_fix_x_axis, self.xz_plot_fix_x_axis_prev) = (self.xz_plot_fix_x_axis_prev,
+                                                                   self.xz_plot_fix_x_axis)
+        self._update_xz_controls_from_state()
+        self.UpdateXZPlot()
+
+    def OnToggleXZSections(self, event):
+        """Toggles between sectioned and global XZ profile plot."""
+        self.xz_plot_use_sections = event.IsChecked()
+        self.UpdateXZPlot()
+        if self.canvas:
+            self.canvas.native.SetFocus()
+
+    def OnToggleRemoveOutliers(self, event):
+        """Toggles outlier removal for the XZ profile plot."""
+        self.xz_plot_remove_outliers = event.IsChecked()
+        self.UpdateXZPlot()
+        if self.canvas:
+            self.canvas.native.SetFocus()
+
+    def OnFitMethodChange(self, event):
+        """Handles selection of a new profile fitting method."""
+        self.xz_plot_fit_method = event.GetString()
+        self.UpdateXZPlot()
         if self.canvas:
             self.canvas.native.SetFocus()
 
@@ -745,38 +1134,6 @@ class PCDViewerFrame(wx.Frame):
             if label_text.lower() in labels_for_file:
                 button.SetValue(True)
 
-    def OnShowXZPlot(self, event):
-        """Creates or updates the X-Z profile plot in a separate window."""
-        if self.points is None:
-            return
-
-        # Get the currently visible points, including all filters
-        total_points = len(self.points)
-        visible_mask = np.ones(total_points, dtype=bool)
-
-        if self.clip_by_y:
-            y_coords = self.points[:, 1]
-            visible_mask &= (y_coords >= self.y_clip_min) & (y_coords <= self.y_clip_max)
-
-        if self.clip_by_index:
-            indices = np.arange(total_points)
-            visible_mask &= (indices >= self.index_clip_min) & (indices <= self.index_clip_max)
-
-        points_to_show = self.points[visible_mask]
-        display_points = points_to_show.copy()
-
-        if self.z_scale_factor != 1.0 and len(display_points) > 0:
-            z_mean = np.mean(display_points[:, 2])
-            display_points[:, 2] = z_mean + (display_points[:, 2] - z_mean) * self.z_scale_factor
-
-        # If the frame exists, destroy it to ensure a fresh start
-        if self.xz_plot_frame:
-            self.xz_plot_frame.Destroy()
-
-        self.xz_plot_frame = XZPlotFrame(self)
-        self.xz_plot_frame.update_plot(display_points, self.z_scale_factor)
-        self.xz_plot_frame.Show()
-
     def OnFlipZ(self, event):
         self.flip_z = event.IsChecked()
         self.UpdateDisplay()
@@ -789,6 +1146,19 @@ class PCDViewerFrame(wx.Frame):
             self.canvas.bgcolor = 'lightpink'
             self.controls_overlay.color = 'black'
         self.canvas.update()
+
+    def OnToggleGrid(self, event):
+        """Toggles the visibility of the 3D grid."""
+        self.show_grid = event.IsChecked()
+        # The grid will be updated in the next UpdateDisplay call,
+        self.UpdateDisplay()
+
+    def OnSymbolChange(self, event):
+        """Handles changing the point symbol."""
+        self.point_symbol = event.GetString()
+        self.UpdateDisplay()
+        if self.canvas:
+            self.canvas.native.SetFocus()
 
     def OnSetPointColor(self, event):
         with wx.ColourDialog(self) as dlg:
@@ -809,8 +1179,15 @@ class PCDViewerFrame(wx.Frame):
         dc.SetBrush(wx.Brush(wx.BLACK))
         dc.DrawRectangle(0, 0, panel_w, panel_h)
 
-        if self.corresponding_image and self.corresponding_image.IsOk():
-            img_w, img_h = self.corresponding_image.GetWidth(), self.corresponding_image.GetHeight()
+        # Decide which image to display
+        image_to_display = None
+        if self.show_projection and self.projected_image:
+            image_to_display = self.projected_image
+        elif self.corresponding_image:
+            image_to_display = self.corresponding_image
+
+        if image_to_display and image_to_display.IsOk():
+            img_w, img_h = image_to_display.GetWidth(), image_to_display.GetHeight()
 
             if panel_w == 0 or panel_h == 0 or img_w == 0 or img_h == 0:
                 return
@@ -820,30 +1197,41 @@ class PCDViewerFrame(wx.Frame):
             new_w, new_h = int(img_w * scale), int(img_h * scale)
 
             # Center the image
-            x = (panel_w - new_w) // 2
-            y = (panel_h - new_h) // 2
+            x_offset = (panel_w - new_w) // 2
+            y_offset = (panel_h - new_h) // 2
 
             # Create a scaled bitmap
-            image = self.corresponding_image.ConvertToImage()
+            image = image_to_display.ConvertToImage()
             image.Rescale(new_w, new_h, wx.IMAGE_QUALITY_HIGH)
             scaled_bitmap = wx.Bitmap(image)
 
-            dc.DrawBitmap(scaled_bitmap, x, y, useMask=False)
+            dc.DrawBitmap(scaled_bitmap, x_offset, y_offset, useMask=False)
 
     def OnSizeImage(self, event):
         if self.image_panel:
             self.image_panel.Refresh()
         event.Skip()
 
+    def OnToggleProjection(self, event):
+        """Toggles projection of points onto the image."""
+        self.show_projection = event.IsChecked()
+        # Redraw the image panel
+        self.image_panel.Refresh()
+        if self.canvas:
+            self.canvas.native.SetFocus()
+
     def UpdateDisplay(self):
         if self.points is None:
             self.markers.set_data(np.empty((0, 3)))
+            if self.grid_visual:
+                self.grid_visual.visible = False
             self.SetStatusText("No file loaded.")
+            self.canvas.update()
             return
 
         point_size = self.point_size_slider.GetValue()
 
-        # --- REFACTORED: Use a single boolean mask for all filters ---
+        # Use a single boolean mask for all filters
         # Start with a mask that includes all points
         total_points = len(self.points)
         visible_mask = np.ones(total_points, dtype=bool)
@@ -861,7 +1249,7 @@ class PCDViewerFrame(wx.Frame):
         points_to_show = self.points[visible_mask]
         colors_to_show = self.colors[visible_mask] if self.colors is not None else None
 
-        # --- NEW: Update the histogram with the Z-data of the *visible* points ---
+        # Update the histogram with the Z-data of the *visible* points
         self.UpdateHistogramPlot(z_data=points_to_show[:, 2])
 
         # Create a copy for all display modifications (scaling, flipping)
@@ -892,7 +1280,13 @@ class PCDViewerFrame(wx.Frame):
         elif self.show_colors and colors_to_show is not None:
             display_colors = colors_to_show
 
-        self.markers.set_data(display_points, size=point_size, edge_color=None, face_color=display_colors)
+        self.markers.set_data(
+            display_points,
+            size=point_size,
+            edge_width=0,  # Set to 0 for cleaner look, especially with shading
+            face_color=display_colors,
+            symbol=self.point_symbol
+        )
 
         visible_count = len(points_to_show)
         total_count = len(self.points)
@@ -910,7 +1304,7 @@ class PCDViewerFrame(wx.Frame):
             status_text += f" | Z-Scale: {self.z_scale_factor}"
         self.SetStatusText(status_text)
 
-        # --- REFACTORED: Update normals visual based on visible and scaled points ---
+        # Update normals visual based on visible and scaled points
         if self.normals is not None and self.show_normals and len(points_to_show) > 0:
             # Get the normals corresponding to the visible points
             visible_normals = self.normals[visible_mask]
@@ -942,7 +1336,287 @@ class PCDViewerFrame(wx.Frame):
         else:
             self.normals_visual.visible = False
 
+        self.UpdateXZPlot()
+        # Update the grid based on the final visible points
+        self.UpdateGrid(display_points)
+
         self.canvas.update()
+
+    def UpdateGrid(self, display_points):
+        """
+        Generates and displays a finite, colored grid on the ground plane based on the
+        extent of the currently visible points and their Y-sections.
+        """
+        if self.grid_visual is None or not self.show_grid or display_points is None or len(display_points) < 2:
+            if self.grid_visual:
+                self.grid_visual.visible = False
+            return
+
+        # Place grid at the bottom of the *displayed* point cloud
+        z_pos = np.min(display_points[:, 2])
+
+        # Get Y-section coloring info from ORIGINAL points
+        # This ensures the grid coloring matches the XZ plot sections
+        visible_mask = np.ones(len(self.points), dtype=bool)
+        if self.clip_by_y:
+            visible_mask &= (self.points[:, 1] >= self.y_clip_min) & (self.points[:, 1] <= self.y_clip_max)
+        if self.clip_by_index:
+            indices = np.arange(len(self.points))
+            visible_mask &= (indices >= self.index_clip_min) & (indices <= self.index_clip_max)
+        y_coords_all = self.points[visible_mask][:, 1]
+
+        if len(y_coords_all) == 0:
+            self.grid_visual.visible = False
+            return
+
+        y_min_all, y_max_all = np.min(y_coords_all), np.max(y_coords_all)
+        y_range = y_max_all - y_min_all
+        num_sections = self.xz_plot_y_sections if y_range > 1e-6 else 1
+        section_width = y_range / num_sections if num_sections > 0 else 0
+        section_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+
+        def get_y_section_color(y_coord):
+            if section_width <= 1e-6:
+                return Color(section_colors[0])
+            index = int((y_coord - y_min_all) / section_width)
+            index = np.clip(index, 0, num_sections - 1)
+            return Color(section_colors[index % len(section_colors)])
+
+        # Calculate grid bounds from DISPLAYED points
+        x_min, x_max = np.min(display_points[:, 0]), np.max(display_points[:, 0])
+        y_min, y_max = np.min(display_points[:, 1]), np.max(display_points[:, 1])
+
+        x_lines = np.arange(np.floor(x_min / self.grid_spacing) * self.grid_spacing,
+                            np.ceil(x_max / self.grid_spacing) * self.grid_spacing + self.grid_spacing,
+                            self.grid_spacing)
+        y_lines = np.arange(np.floor(y_min / self.grid_spacing) * self.grid_spacing,
+                            np.ceil(y_max / self.grid_spacing) * self.grid_spacing + self.grid_spacing,
+                            self.grid_spacing)
+
+        if len(x_lines) < 2 or len(y_lines) < 2:
+            self.grid_visual.visible = False
+            return
+
+        vertices = []
+        colors = []
+
+        # Lines along Y axis (constant X), segmented and colored by Y-section
+        for x in x_lines:
+            for i in range(len(y_lines) - 1):
+                y_start, y_end = y_lines[i], y_lines[i + 1]
+                y_mid = (y_start + y_end) / 2.0
+                segment_color = get_y_section_color(y_mid)
+                vertices.extend([[x, y_start, z_pos], [x, y_end, z_pos]])
+                colors.extend([segment_color.rgba, segment_color.rgba])
+
+        for y in y_lines:  # Lines along X axis (constant Y) - section color
+            line_color = get_y_section_color(y)
+            vertices.extend([[x_lines[0], y, z_pos], [x_lines[-1], y, z_pos]])
+            colors.extend([line_color.rgba, line_color.rgba])
+
+        self.grid_visual.set_data(pos=np.array(vertices, dtype=np.float32),
+                                  color=np.array(colors, dtype=np.float32),
+                                  connect='segments')
+        self.grid_visual.visible = True
+
+    def UpdateXZPlot(self):
+        """Creates or updates the X-Z profile plot in the main window."""
+        if not self.xz_canvas:
+            return
+
+        if self.points is None or len(self.points) == 0:
+            self.xz_axes.clear()
+            self.xz_axes.text(0.5, 0.5, 'No points to display.', horizontalalignment='center',
+                              verticalalignment='center')
+            self.xz_canvas.draw()
+            return
+
+        # Get the currently visible points, including all filters
+        total_points = len(self.points)
+        visible_mask = np.ones(total_points, dtype=bool)
+
+        if self.clip_by_y:
+            y_coords = self.points[:, 1]
+            visible_mask &= (y_coords >= self.y_clip_min) & (y_coords <= self.y_clip_max)
+
+        if self.clip_by_index:
+            indices = np.arange(total_points)
+            visible_mask &= (indices >= self.index_clip_min) & (indices <= self.index_clip_max)
+
+        points_to_show = self.points[visible_mask]
+
+        # Check if the X-span is large enough to be meaningful
+        if len(points_to_show) < 2:
+            self.xz_axes.clear()
+            self.xz_axes.text(0.5, 0.5, 'Not enough points to plot profile.',
+                              horizontalalignment='center', verticalalignment='center')
+            self.xz_figure.tight_layout()
+            self.xz_canvas.draw()
+            return
+
+        x_span = np.ptp(points_to_show[:, 0])
+        if x_span < self.xz_plot_min_x_span_m:
+            self.xz_axes.clear()
+            self.xz_axes.text(0.5, 0.5, f'X-span ({x_span:.2f}m) is below the minimum of {self.xz_plot_min_x_span_m}m.',
+                              horizontalalignment='center', verticalalignment='center', wrap=True)
+            self.xz_figure.tight_layout()
+            self.xz_canvas.draw()
+            return
+
+        # Create a scaled copy for plotting, same as the 3D view
+        display_points = points_to_show.copy()
+        if self.z_scale_factor != 1.0 and len(display_points) > 0:
+            z_mean = np.mean(display_points[:, 2])
+            display_points[:, 2] = z_mean + (display_points[:, 2] - z_mean) * self.z_scale_factor
+
+        def fit_and_plot_trendline(x_coords, z_coords, color='r', linewidth=2.0, alpha=1.0, trendline_points=500):
+            """Helper to fit and plot a trendline, with optional outlier removal."""
+            if len(x_coords) <= 20:
+                return
+
+            x_to_fit, z_to_fit = x_coords, z_coords
+
+            # Outlier removal using IQR
+            if self.xz_plot_remove_outliers and len(z_to_fit) > 1:
+                q1 = np.percentile(z_to_fit, 25)
+                q3 = np.percentile(z_to_fit, 75)
+                iqr = q3 - q1
+                # A factor of 0 means no outlier removal, so we check for that
+                if iqr > 1e-9 and self.xz_plot_outlier_iqr_factor > 0:
+                    lower_bound = q1 - (self.xz_plot_outlier_iqr_factor * iqr)
+                    upper_bound = q3 + (self.xz_plot_outlier_iqr_factor * iqr)
+                    inlier_mask = (z_to_fit >= lower_bound) & (z_to_fit <= upper_bound)
+                    x_to_fit = x_to_fit[inlier_mask]
+                    z_to_fit = z_to_fit[inlier_mask]
+
+            if len(x_to_fit) <= 20:
+                print("Not enough points left after outlier removal to fit trendline.")
+                return
+
+            # Use selected fitting method
+            if self.xz_plot_fit_method == "LOWESS" and statsmodels_available:
+                try:
+                    # LOWESS returns smoothed points. The first column is x, second is y.
+                    # It requires sorted x values for plotting.
+                    smoothed = lowess(z_to_fit, x_to_fit, frac=self.xz_plot_lowess_frac)
+                    x_trend = smoothed[:, 0]
+                    z_trend = smoothed[:, 1]
+                except Exception as e:
+                    print(f"Could not fit LOWESS: {e}")
+                    return
+            else:  # Default to Polynomial
+                try:
+                    coeffs = np.polyfit(x_to_fit, z_to_fit, 20)
+                    poly = np.poly1d(coeffs)  # No need to create x_trend here, it's done below
+                    x_trend = np.linspace(x_coords.min(), x_coords.max(), trendline_points)  # Create x_trend for poly
+                    z_trend = poly(x_trend)  # Calculate z_trend for poly
+                except (np.linalg.LinAlgError, np.polynomial.polyutils.RankWarning):
+                    print("Could not fit polynomial trendline. The data may be poorly conditioned.")
+                    return
+
+            # Clip the trendline to the visible plot area
+            # This prevents the fit from flying out of bounds in sparse areas.
+            z_trend_clipped = np.clip(z_trend, self.xz_plot_z_min, self.xz_plot_z_max)
+            self.xz_axes.plot(x_trend, z_trend_clipped, '-', linewidth=linewidth, color=color, alpha=alpha)
+
+        self.xz_axes.clear()
+
+        # Set background colors for Z-range
+        # Set the default background color for the axes patch
+        self.xz_axes.set_facecolor('lightpink')
+        # Add a semi-transparent yellow band for the wider Z-range [-1cm, 1cm]
+        self.xz_axes.axhspan(-1, 1, facecolor='lightyellow', alpha=0.5)
+        # Add a semi-transparent green band for the narrow Z-range [-0.5cm, 0.5cm] on top
+        self.xz_axes.axhspan(-0.5, 0.5, facecolor='lightgreen', alpha=0.5)
+
+        if self.xz_plot_use_sections:
+            # --- Section plot based on Y-axis values ---
+            plot_title = f"X-Z Profile by Y-Section ({len(display_points)} pts)"
+            y_coords_all = points_to_show[:, 1]
+            if len(y_coords_all) > 0:
+                y_min_all, y_max_all = np.min(y_coords_all), np.max(y_coords_all)
+                y_range = y_max_all - y_min_all
+                num_sections = self.xz_plot_y_sections if y_range > 1e-6 else 1
+                section_width = y_range / num_sections
+                section_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+
+                for i in range(num_sections):
+                    section_y_min = y_min_all + i * section_width
+                    section_y_max = y_min_all + (i + 1) * section_width if i < num_sections - 1 else y_max_all + 1e-6
+                    section_mask = (y_coords_all >= section_y_min) & (y_coords_all < section_y_max)
+                    display_section_points = display_points[section_mask]
+                    if len(display_section_points) < 2:
+                        continue
+
+                    # Also filter subsections by their X-span
+                    section_x_span = np.ptp(display_section_points[:, 0])
+                    if section_x_span < self.xz_plot_min_x_span_m:
+                        continue  # Skip this section if its span is too small
+
+                    # Split section into subgroups based on X-axis gaps
+                    # Sort points by X to find gaps
+                    sort_indices = np.argsort(display_section_points[:, 0])
+                    sorted_section_points = display_section_points[sort_indices]
+
+                    # Find gaps larger than the threshold
+                    x_coords_sorted = sorted_section_points[:, 0]
+                    x_diffs = np.diff(x_coords_sorted)
+                    gap_indices = np.where(x_diffs > self.xz_plot_section_gap_m)[0] + 1
+
+                    # Split the points into subgroups
+                    point_subgroups = np.split(sorted_section_points, gap_indices)
+                    color = section_colors[i % len(section_colors)]
+                    has_labeled_section = False
+
+                    for subgroup in point_subgroups:
+                        if len(subgroup) < 2:
+                            continue
+
+                        points_to_plot_sec = subgroup
+                        if len(subgroup) > 50000:
+                            choice = np.random.choice(len(subgroup), 50000, replace=False)
+                            points_to_plot_sec = subgroup[choice]
+
+                        x_coords_sec = points_to_plot_sec[:, 0]
+                        z_coords_sec = -points_to_plot_sec[:, 2] / self.z_scale_factor * 100
+
+                        label = f'Y: {section_y_min:.2f}-{section_y_max:.2f}m' if not has_labeled_section else None
+                        self.xz_axes.plot(x_coords_sec, z_coords_sec, '.', markersize=2, alpha=0.6, color=color,
+                                          label=label)
+                        fit_and_plot_trendline(x_coords_sec, z_coords_sec, color=color, linewidth=2.5, alpha=0.9,
+                                               trendline_points=200)
+                        has_labeled_section = True
+
+                self.xz_axes.legend(title="Y-Sections", fontsize='small', loc='lower left')
+        else:
+            # --- Global Profile Plot ---
+            points_to_plot = display_points
+            if len(display_points) > 100000:
+                choice = np.random.choice(len(display_points), 100000, replace=False)
+                points_to_plot = display_points[choice]
+                plot_title = f"X-Z Profile (100k of {len(display_points)})"
+            else:
+                plot_title = f"X-Z Profile ({len(display_points)} points)"
+            x_coords = points_to_plot[:, 0]
+            z_coords = -points_to_plot[:, 2] / self.z_scale_factor * 100
+            self.xz_axes.plot(x_coords, z_coords, '.', markersize=2, alpha=0.7, label='All Points')
+            fit_and_plot_trendline(x_coords, z_coords, color='r', linewidth=2.0)
+            self.xz_axes.legend(loc='lower left')
+
+        # Common final steps for both plot types
+        self.xz_axes.set_xlabel("X-coordinate (m)")
+        self.xz_axes.set_ylabel("Z-coordinate (cm)")
+        self.xz_axes.set_title(plot_title)
+        self.xz_axes.grid(True)
+        self.xz_axes.set_aspect('auto', adjustable='box')
+        self.xz_axes.set_ylim(self.xz_plot_z_min, self.xz_plot_z_max)
+
+        # Apply fixed X-axis limits if enabled
+        if self.xz_plot_fix_x_axis:
+            self.xz_axes.set_xlim(self.xz_plot_x_min, self.xz_plot_x_max)
+
+        self.xz_figure.tight_layout()
+        self.xz_canvas.draw()
 
     def UpdateHistogramPlot(self, z_data=None):
         """Creates or updates the Z-value histogram plot based on visible data."""
@@ -966,7 +1640,7 @@ class PCDViewerFrame(wx.Frame):
             # Create the histogram, getting the patches (the bars)
             n, bins, patches = self.hist_axes.hist(z_data, bins=100, log=True)
 
-            # --- NEW: Color histogram bars based on Z-slider range ---
+            # Color histogram bars based on Z-slider range
             colormap = get_colormap('viridis')
             # Create a normalizer that maps the selected color range to the colormap range (0-1)
             norm = matplotlib.colors.Normalize(vmin=self.z_color_min, vmax=self.z_color_max)
@@ -1057,14 +1731,16 @@ class PCDViewerFrame(wx.Frame):
     def LoadThread(self, filepath):
         points, colors = open_point_cloud_file(filepath)
 
-        # --- NEW: Load corresponding image ---
+        # Load corresponding image and projected image if available
         image_bitmap = None
+        projected_image_bitmap = None
         try:
             base_name = os.path.splitext(os.path.basename(filepath))[0]
             pcd_dir = os.path.dirname(filepath)
             parent_dir = os.path.dirname(pcd_dir)
             # The path is one dir up, then /camera/front/*.jpg
             image_path = os.path.join(parent_dir, 'camera', 'front', base_name + '.jpg')
+            projected_image_path = os.path.join(parent_dir, 'camera', 'front', base_name + '_p.jpg')
 
             if os.path.exists(image_path):
                 # Use wx.Image to load, it supports more formats like jpg
@@ -1076,12 +1752,24 @@ class PCDViewerFrame(wx.Frame):
                     print(f"Found image file, but failed to load: {image_path}")
             else:
                 print(f"Corresponding image not found at: {image_path}")
+
+            if os.path.exists(projected_image_path):
+                wx_proj_image = wx.Image(projected_image_path, wx.BITMAP_TYPE_ANY)
+                if wx_proj_image.IsOk():
+                    projected_image_bitmap = wx_proj_image.ConvertToBitmap()
+                    print(f"Found and loaded projected image: {projected_image_path}")
+                else:
+                    print(f"Found projected image file, but failed to load: {projected_image_path}")
+            else:
+                print(f"Projected image not found at: {projected_image_path}")
+
         except Exception as e:
-            print(f"Error while searching for or loading corresponding image: {e}")
+            print(f"Error while searching for or loading corresponding images: {e}")
 
-        wx.CallAfter(self.OnLoadComplete, points, colors, image_bitmap, os.path.basename(filepath))
+        wx.CallAfter(self.OnLoadComplete, points, colors, image_bitmap, os.path.basename(filepath),
+                     projected_image_bitmap)
 
-    def OnLoadComplete(self, points, colors, image_bitmap, filename):
+    def OnLoadComplete(self, points, colors, image_bitmap, filename, projected_image_bitmap):
         wx.EndBusyCursor()
         if points is None:
             wx.LogError(f"Failed to open or read point cloud from file: {filename}.")
@@ -1092,13 +1780,14 @@ class PCDViewerFrame(wx.Frame):
         self.colors = colors
         self.normals = None
         self.corresponding_image = image_bitmap
+        self.projected_image = projected_image_bitmap
 
         nav_info = ""
         if self.file_list:
             nav_info = f"({self.current_file_index + 1}/{len(self.file_list)})"
         self.SetTitle(f"Point Cloud Viewer: {filename} {nav_info} | InViLab - UAntwerpen")
 
-        # --- MODIFIED: Make view settings persistent across file loads ---
+        # Make view settings persistent across file loads
         has_colors = self.colors is not None
         self.toggle_colors_item.Enable(has_colors)
         if not has_colors:
@@ -1108,6 +1797,7 @@ class PCDViewerFrame(wx.Frame):
         # Update menu items to reflect the persistent state of the view options.
         self.toggle_colors_item.Check(self.show_colors)
         self.flip_z_item.Check(self.flip_z)
+        self.show_grid_item.Check(self.show_grid)
         self.color_by_z_item.Check(self.color_by_z)
         self.clip_by_y_item.Check(self.clip_by_y)
         self.clip_by_index_item.Check(self.clip_by_index)
@@ -1118,7 +1808,7 @@ class PCDViewerFrame(wx.Frame):
         self.clip_by_y_item.Enable(True)
         self.clip_by_index_item.Enable(True)
 
-        # --- MODIFIED: Default Z-coloring range to the 5th-95th percentile ---
+        # Default Z-coloring range to the 5th-95th percentile
         z_coords = self.points[:, 2]
         self.z_data_min = np.min(z_coords)
         self.z_data_max = np.max(z_coords)
@@ -1142,7 +1832,7 @@ class PCDViewerFrame(wx.Frame):
         self.z_max_slider.Enable(is_z_color_enabled)
         self.hist_canvas.Enable(is_z_color_enabled)
 
-        # --- NEW: Initialize Y-clipping state on load ---
+        # Initialize Y-clipping state on load
         y_coords = self.points[:, 1]
         self.y_data_min = np.min(y_coords)
         self.y_data_max = np.max(y_coords)
@@ -1154,7 +1844,7 @@ class PCDViewerFrame(wx.Frame):
         self.y_min_slider.Enable(is_y_clip_enabled)
         self.y_max_slider.Enable(is_y_clip_enabled)
 
-        # --- NEW: Initialize Index-clipping state on load ---
+        # Initialize Index-clipping state on load
         self.index_data_min = 0
         self.index_data_max = len(self.points) - 1
         self.index_clip_min = self.index_data_min
@@ -1173,29 +1863,57 @@ class PCDViewerFrame(wx.Frame):
 
         self.point_size_slider.Enable(True)
 
-        # --- FIX: Enable and reset the Z-Scale slider on new file load ---
+        # Enable point style controls
+        self.symbol_choice.Enable(True)
+        self.symbol_choice.SetStringSelection(self.point_symbol)
+
+        # Enable and reset the Z-Scale slider on new file load
         self.z_scale_slider.Enable(True)
         self.z_scale_factor = 1.0
         self.z_scale_slider.SetValue(10)  # Reset to 1.0x scale
 
-        # --- NEW: Enable the XZ plot button ---
-        self.show_xz_plot_button.Enable(True)
+        # Enable the XZ plot canvas and its controls
+        self.xz_canvas.Enable(True)
+        self.xz_plot_sections_button.Enable(True)
+        self.xz_remove_outliers_button.Enable(True)
+        self.fit_method_choice.Enable(True)
+        self.xz_z_min_ctrl.Enable(True)
+        self.xz_z_max_ctrl.Enable(True)
+        self.xz_z_min_ctrl.SetValue(f"{self.xz_plot_z_min:.2f}")
+        self.xz_z_max_ctrl.SetValue(f"{self.xz_plot_z_max:.2f}")
+        self.xz_fix_x_axis_button.Enable(True)
+        self.xz_x_min_ctrl.Enable(self.xz_plot_fix_x_axis)
+        self.xz_x_max_ctrl.Enable(self.xz_plot_fix_x_axis)
+        self.xz_x_min_ctrl.SetValue(f"{self.xz_plot_x_min:.2f}")
+        self.xz_x_max_ctrl.SetValue(f"{self.xz_plot_x_max:.2f}")
 
-        # --- NEW: Update label button states based on CSV file ---
+        # Enable/disable axis control buttons
+        self.xz_autoscale_button.Enable(True)
+        self.xz_defaults_button.Enable(True)
+        self.xz_previous_settings_available = False  # Reset on new file
+        self.xz_previous_button.Enable(False)
+
+        # Update projection button state
+        can_project = self.projected_image is not None
+        self.projection_button.Enable(can_project)
+        if not can_project and self.show_projection:
+            # If we can no longer project, turn it off
+            self.show_projection = False
+            self.projection_button.SetValue(False)
+
+        # Update label button states based on CSV file
         self.UpdateLabelButtonStates()
 
         self.UpdateDisplay()
         self.OnResetView()
 
-        # --- NEW: Refresh the image panel ---
+        # Refresh the image panel
         self.image_panel.Refresh()
 
-        # --- FIX: Set focus to the canvas after loading to ensure keys are captured ---
+        # Set focus to the canvas after loading to ensure keys are captured
         self.canvas.native.SetFocus()
 
     def OnExit(self, event):
-        if self.xz_plot_frame:
-            self.xz_plot_frame.Close()
         self.Close()
 
 
