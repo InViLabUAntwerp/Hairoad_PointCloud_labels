@@ -205,6 +205,12 @@ class PCDViewerFrame(wx.Frame):
         self.show_projection = False
         self.projection_button = None
 
+        # Preloading and Caching attributes
+        self.preload_cache = {}
+        self.cache_lock = threading.Lock()
+        self.CACHE_SIZE = 15  # Max items in cache (e.g., current +/- 7)
+        self.preloading_threads = []
+
         self.InitUI()
         self.Maximize()
         self.Show()
@@ -494,8 +500,9 @@ class PCDViewerFrame(wx.Frame):
             "Shift + LMB: Pan\n"
             "Shift + RMB: FOV\n"
             "ctrl + h: Show histogram colors"
-            "ctrl + c: Show RGB colors"
-            "'n' / 'p': Next/Prev File"
+            "ctrl + c: Show RGB colors\n"
+            "'n' / 'p': Next/Prev File\n"
+            "'s': Skip 10 Files"
         )
         self.controls_overlay = Text(
             controls_text, color='black', font_size=10, anchor_x='right',
@@ -720,14 +727,27 @@ class PCDViewerFrame(wx.Frame):
             new_index = (self.current_file_index + 1) % len(self.file_list)
         elif keycode == ord('P'):
             new_index = (self.current_file_index - 1) % len(self.file_list)
+        elif keycode == ord('S'):
+            new_index = (self.current_file_index + 10) % len(self.file_list)
         else:
             event.Skip()
             return
 
-        if new_index != self.current_file_index:
+        if new_index == self.current_file_index:
+            return
+
+        # Check if the requested file is in the cache
+        new_filepath = os.path.join(self.current_dir, self.file_list[new_index])
+        with self.cache_lock:
+            cached_data = self.preload_cache.pop(new_filepath, None)
+
+        if cached_data:
+            # If found in cache, load it directly without a thread
+            print(f"Loading {os.path.basename(new_filepath)} from cache.")
             self.current_file_index = new_index
-            new_filename = self.file_list[self.current_file_index]
-            new_filepath = os.path.join(self.current_dir, new_filename)
+            self.OnLoadComplete(*cached_data)
+        else:
+            # If not in cache, load it the normal way
             self.StartLoadingFile(new_filepath)
 
     def OnCanvasResize(self, event):
@@ -745,7 +765,18 @@ class PCDViewerFrame(wx.Frame):
                            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fd:
             if fd.ShowModal() == wx.ID_CANCEL:
                 return
-            self.StartLoadingFile(fd.GetPath())
+            filepath = fd.GetPath()
+
+            # On manual open, clear the cache and stop any preloading
+            self._clear_preloader()
+            with self.cache_lock:
+                self.preload_cache.clear()
+
+            # Check if the file is in the cache (it shouldn't be, but for safety)
+            cached_data = self.preload_cache.pop(filepath, None)
+            if not cached_data:
+                self.StartLoadingFile(filepath)
+
 
     def OnPointSizeChange(self, event):
         self.UpdateDisplay()
@@ -1696,6 +1727,10 @@ class PCDViewerFrame(wx.Frame):
         self.show_normals = True
         self.UpdateDisplay()
 
+    def _clear_preloader(self):
+        """Wait for any existing preloading threads to finish."""
+        [t.join() for t in self.preloading_threads if t.is_alive()]
+
     def OnShowNormals(self, event):
         self.show_normals = event.IsChecked()
         self.UpdateDisplay()
@@ -1725,52 +1760,72 @@ class PCDViewerFrame(wx.Frame):
             self.current_dir = None
 
         self.SetStatusText(f"Opening {os.path.basename(filepath)}...")
+        # If loading on-demand, check cache first.
+        with self.cache_lock:
+            cached_data = self.preload_cache.pop(filepath, None)
+
+        if cached_data:
+            print(f"Loading {os.path.basename(filepath)} from cache.")
+            self.OnLoadComplete(*cached_data)
+            return
+
         wx.BeginBusyCursor()
         threading.Thread(target=self.LoadThread, args=(filepath,)).start()
 
     def LoadThread(self, filepath):
-        points, colors = open_point_cloud_file(filepath)
+        """Worker thread for on-demand file loading."""
+        loaded_data = self._load_file_data(filepath)
+        wx.CallAfter(self.OnLoadComplete, *loaded_data)
 
-        # Load corresponding image and projected image if available
+    def _load_associated_images(self, pcd_filepath):
+        """Helper to load .jpg and _p.jpg images for a given point cloud file."""
         image_bitmap = None
         projected_image_bitmap = None
         try:
-            base_name = os.path.splitext(os.path.basename(filepath))[0]
-            pcd_dir = os.path.dirname(filepath)
+            base_name = os.path.splitext(os.path.basename(pcd_filepath))[0]
+            pcd_dir = os.path.dirname(pcd_filepath)
             parent_dir = os.path.dirname(pcd_dir)
-            # The path is one dir up, then /camera/front/*.jpg
             image_path = os.path.join(parent_dir, 'camera', 'front', base_name + '.jpg')
             projected_image_path = os.path.join(parent_dir, 'camera', 'front', base_name + '_p.jpg')
 
             if os.path.exists(image_path):
-                # Use wx.Image to load, it supports more formats like jpg
                 wx_image = wx.Image(image_path, wx.BITMAP_TYPE_ANY)
                 if wx_image.IsOk():
                     image_bitmap = wx_image.ConvertToBitmap()
-                    print(f"Found and loaded corresponding image: {image_path}")
-                else:
-                    print(f"Found image file, but failed to load: {image_path}")
-            else:
-                print(f"Corresponding image not found at: {image_path}")
 
             if os.path.exists(projected_image_path):
                 wx_proj_image = wx.Image(projected_image_path, wx.BITMAP_TYPE_ANY)
                 if wx_proj_image.IsOk():
                     projected_image_bitmap = wx_proj_image.ConvertToBitmap()
-                    print(f"Found and loaded projected image: {projected_image_path}")
-                else:
-                    print(f"Found projected image file, but failed to load: {projected_image_path}")
-            else:
-                print(f"Projected image not found at: {projected_image_path}")
 
         except Exception as e:
-            print(f"Error while searching for or loading corresponding images: {e}")
+            print(f"Error loading associated images for {pcd_filepath}: {e}")
 
-        wx.CallAfter(self.OnLoadComplete, points, colors, image_bitmap, os.path.basename(filepath),
-                     projected_image_bitmap)
+        return image_bitmap, projected_image_bitmap
+
+    def _load_file_data(self, filepath):
+        """Loads all data for a given filepath. This is the core loading logic."""
+        points, colors = open_point_cloud_file(filepath)
+        image_bitmap, projected_image_bitmap = self._load_associated_images(filepath)
+        return points, colors, image_bitmap, os.path.basename(filepath), projected_image_bitmap
+
+    def _preload_worker(self, filepath_to_load):
+        """Worker thread for preloading a single file into the cache."""
+        with self.cache_lock:
+            if filepath_to_load in self.preload_cache:
+                return  # Already cached or being cached
+
+        # Load data outside the lock
+        loaded_data = self._load_file_data(filepath_to_load)
+
+        with self.cache_lock:
+            self.preload_cache[filepath_to_load] = loaded_data
+            print(f"Preloaded {os.path.basename(filepath_to_load)} into cache.")
 
     def OnLoadComplete(self, points, colors, image_bitmap, filename, projected_image_bitmap):
-        wx.EndBusyCursor()
+        if wx.IsBusy():
+            wx.EndBusyCursor()
+
         if points is None:
             wx.LogError(f"Failed to open or read point cloud from file: {filename}.")
             self.SetStatusText("Failed to load file.")
@@ -1903,6 +1958,41 @@ class PCDViewerFrame(wx.Frame):
 
         # Update label button states based on CSV file
         self.UpdateLabelButtonStates()
+
+        # --- Trigger Preloading and Cache Management ---
+        self._clear_preloader()  # Ensure previous preloading is done
+        self.preloading_threads.clear()
+
+        if self.file_list and len(self.file_list) > 1:
+            # 1. Manage cache size
+            with self.cache_lock:
+                # Determine which indices to keep in the cache
+                current_idx = self.current_file_index
+                cache_radius = self.CACHE_SIZE // 2
+                indices_to_keep = {
+                    (current_idx + i) % len(self.file_list)
+                    for i in range(-cache_radius, cache_radius + 1)
+                }
+                filepaths_to_keep = {os.path.join(self.current_dir, self.file_list[i]) for i in indices_to_keep}
+
+                # Remove keys that are no longer nearby
+                keys_to_remove = [key for key in self.preload_cache if key not in filepaths_to_keep]
+                for key in keys_to_remove:
+                    del self.preload_cache[key]
+                    print(f"Removed {os.path.basename(key)} from cache.")
+
+            # 2. Start preloading neighbors
+            indices_to_preload = set()
+            # Preload 5 files forward and 5 files backward
+            for i in range(1, 6):
+                indices_to_preload.add((self.current_file_index + i) % len(self.file_list))
+                indices_to_preload.add((self.current_file_index - i) % len(self.file_list))
+
+            for idx in indices_to_preload:
+                filepath = os.path.join(self.current_dir, self.file_list[idx])
+                thread = threading.Thread(target=self._preload_worker, args=(filepath,))
+                self.preloading_threads.append(thread)
+                thread.start()
 
         self.UpdateDisplay()
         self.OnResetView()
